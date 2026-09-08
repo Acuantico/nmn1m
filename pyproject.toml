@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poorsdr-libro-guardia"
+version = "1.0.0a1"
+description = "Nunca Más, Ni Una Más (NMN1M): cuaderno de estación / contest logger, usable solo o integrado con PoorSDR4All"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0 AND MIT AND CC-BY-4.0"
+license-files = ["LICENSE", "LICENSES/*", "DATA_PROVENANCE.md"]
+authors = [{ name = "Acuantico Power" }]
+# Sin dependencia dura de poorsdr4all: usa sus rutas XDG cuando está
+# instalado (integrado), y una copia mínima equivalente si no (solo).
+# Ver el bloque try/except al principio de Libro-Guardia.py.
+
+[project.entry-points."poorsdr.plugins"]
+libro_guardia = "poorsdr_libro_guardia.plugin:PLUGIN"
+
+[project.scripts]
+poorsdr-libro-guardia = "poorsdr_libro_guardia.plugin:run_standalone"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+poorsdr_libro_guardia = [
+    "Libro-Guardia.py",
+    "assets/**/*",
+    "templates/**/*",
+]

@@ -1,0 +1,13 @@
+# Datos del usuario (copiados del Libro de Guardia original para que funcione
+# de inmediato); no se versionan.
+src/poorsdr_libro_guardia/logs/
+src/poorsdr_libro_guardia/Copias-Log-Aut/
+src/poorsdr_libro_guardia/logs-Copia-Manual/
+src/poorsdr_libro_guardia/libro_guardia_settings.json
+src/poorsdr_libro_guardia/config.json
+src/poorsdr_libro_guardia/assets/flag-cache/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
