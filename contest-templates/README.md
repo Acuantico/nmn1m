@@ -5,6 +5,9 @@ el cuaderno de estación / contest logger de este repositorio. No van
 incluidas en la instalación principal — descarga solo la que necesites e
 instálala desde la propia aplicación.
 
+📖 Guía de uso de las plantillas en la wiki de NMN1M:
+https://acuanticopower.com/nmn1m/#concursos-nmn1m
+
 ## Instalación
 
 1. Descarga el archivo `.py` del concurso que quieras (p. ej. `cq_wpx.py`).

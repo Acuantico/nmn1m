@@ -4,8 +4,13 @@ Cuaderno de estación / contest logger para radioafición y CB: registro de
 QSO, cascada de bandas, mapa de contactos, sincronización LAN entre varios
 equipos y funciones de concurso mediante plantillas instalables.
 
-Funciona **solo** o **integrado con [PoorSDR4All](https://acuanticopower.com/poorsdr4all)**
+Funciona **solo** o **integrado con [PoorSDR4All](https://acuanticopower.com/poorsdr4all/)**
 (añade un botón «Log» a su consola). Es el mismo programa en ambos casos.
+
+📖 **Wiki / documentación de usuario:** https://acuanticopower.com/nmn1m/
+
+🪟 **Windows:** ejecutable listo para usar, sin instalar Python, en
+[Releases](https://github.com/Acuantico/nmn1m/releases).
 
 ## Instalación
 
