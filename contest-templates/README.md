@@ -22,6 +22,7 @@ ejecuta dentro de la aplicación.
 | `cq_wpx.py` | CQ WPX | HAM |
 | `iaru_hf.py` | IARU HF | HAM |
 | `sm.py` | SM | HAM |
+| `cq_ww_rtty.py` | CQ WW RTTY | HAM |
 
 ## Crear una plantilla propia
 
