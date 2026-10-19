@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poorsdr-libro-guardia"
-version = "1.0.0a1"
+version = "1.0.0a2"
 description = "Nunca Más, Ni Una Más (NMN1M): cuaderno de estación / contest logger, usable solo o integrado con PoorSDR4All"
 readme = "README.md"
 requires-python = ">=3.11"

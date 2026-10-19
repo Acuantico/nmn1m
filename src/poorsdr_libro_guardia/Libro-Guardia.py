@@ -122,6 +122,265 @@ DEFAULT_DB_EXT = ".sqlite"
 APP_ICON_ICO = os.path.join(BASE_DIR, "assets", "app_icon.ico")
 APP_ICON_PNG = os.path.join(BASE_DIR, "assets", "app_icon.png")
 APP_TOOLBAR_LOGO = os.path.join(BASE_DIR, "assets", "toolbar_logo.png")
+TOOLBAR_LOGO_NATIVE = 124  # lado (px) del PNG original
+
+# Mapa: la ruta (línea, «Mi QTH» y km) usa un color que no se confunde con las etiquetas de ciudades ni con el
+# acento del tema. Cámbialo aquí si prefieres otro.
+MAP_ROUTE_COLOR = "#00e5ff"
+MAP_PLATE_BG = "#0b1520"  # placa oscura bajo los textos de la ruta
+
+
+class MapLabelPlacer:
+    """Reserva los rectángulos de las etiquetas del mapa y rechaza las que se pisan.
+
+    La prioridad la da el orden en que se piden: lo primero que se coloca gana. Así a poco zoom quedan solo las
+    etiquetas importantes y, al acercarse, van cabiendo más. ``bounds`` (x0, y0, x1, y1) mantiene las etiquetas
+    dentro del visor, sin cortarlas en el borde. Los rectángulos se indexan por cuadrículas: comprobar uno nuevo
+    solo mira a sus vecinos, no a todos.
+    """
+
+    _CELDA = 64
+
+    def __init__(self, pad: int = 3, bounds: tuple[float, float, float, float] | None = None) -> None:
+        self.pad = pad
+        self.bounds = bounds
+        self.rects: list[tuple[float, float, float, float]] = []
+        self._rejilla: dict[tuple[int, int], list[int]] = {}
+
+    def _celdas(self, x0: float, y0: float, x1: float, y1: float):
+        c, p = self._CELDA, self.pad
+        for ix in range(int((x0 - p) // c), int((x1 + p) // c) + 1):
+            for iy in range(int((y0 - p) // c), int((y1 + p) // c) + 1):
+                yield (ix, iy)
+
+    def fits(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+        if self.bounds is not None:
+            bx0, by0, bx1, by1 = self.bounds
+            if x0 < bx0 or y0 < by0 or x1 > bx1 or y1 > by1:
+                return False
+        p = self.pad
+        vistos: set[int] = set()
+        for celda in self._celdas(x0, y0, x1, y1):
+            for i in self._rejilla.get(celda, ()):
+                if i in vistos:
+                    continue
+                vistos.add(i)
+                a, b, c, d = self.rects[i]
+                if x0 < c + p and x1 > a - p and y0 < d + p and y1 > b - p:
+                    return False
+        return True
+
+    def reserve(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        self.rects.append((x0, y0, x1, y1))
+        i = len(self.rects) - 1
+        for celda in self._celdas(x0, y0, x1, y1):
+            self._rejilla.setdefault(celda, []).append(i)
+
+    def place(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+        if not self.fits(x0, y0, x1, y1):
+            return False
+        self.reserve(x0, y0, x1, y1)
+        return True
+
+
+class MapTextMeter:
+    """Mide el texto del mapa SIN llamar a Tk por cada etiqueta.
+
+    Cada llamada a ``font.measure`` cuesta ~1 ms; con miles de candidatas por redibujado el mapa iba a segundos.
+    Aquí el ancho de cada carácter se mide una sola vez y el de un texto es la suma (Tk no aplica kerning).
+    ``font`` solo necesita ``measure(texto)`` y ``metrics("linespace")``.
+    """
+
+    def __init__(self, font) -> None:
+        self._font = font
+        self._widths: dict[str, int] = {}
+        self.height = int(font.metrics("linespace"))
+
+    def width(self, text: str) -> int:
+        widths = self._widths
+        total = 0
+        for ch in text:
+            w = widths.get(ch)
+            if w is None:
+                w = widths[ch] = int(self._font.measure(ch))
+            total += w
+        return total
+
+
+UI_FONT_SCALES = (100, 125, 150)
+UI_FONT_SCALE_NAMES = {100: "Normal", 125: "Grande", 150: "Extra grande"}
+UI_NAMED_FONTS = (
+    "TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont",
+    "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont", "TkFixedFont",
+)
+
+
+def normalize_ui_font_scale(value) -> int:
+    """Acepta 125, "125", "125 %" o el nombre ("Grande") y devuelve el valor permitido más cercano (100 si no se entiende)."""
+    texto = str(value).strip().lower()
+    for pct, nombre in UI_FONT_SCALE_NAMES.items():
+        if texto == nombre.lower():
+            return pct
+    digitos = "".join(ch for ch in str(value) if ch.isdigit())
+    if not digitos:
+        return 100
+    n = int(digitos)
+    return min(UI_FONT_SCALES, key=lambda v: abs(v - n))
+
+
+def ui_font_scale_label(pct: int) -> str:
+    """Texto del selector: «Grande» (sin porcentajes; el valor numérico solo se guarda internamente)."""
+    return UI_FONT_SCALE_NAMES[normalize_ui_font_scale(pct)]
+
+
+def ui_scaled(size: int, pct: int) -> int:
+    """Escala un tamaño de letra. Los tamaños negativos de Tk (píxeles) conservan el signo."""
+    n = max(1, round(abs(int(size)) * int(pct) / 100.0))
+    return -n if int(size) < 0 else n
+
+
+class UiFontScaler:
+    """Escala las fuentes por defecto de Tk (las que siguen formularios, botones, menús y tablas).
+
+    Recuerda el tamaño ORIGINAL de cada una la primera vez, así escalar varias veces nunca acumula errores.
+    Al cambiar una fuente con nombre, Tk actualiza al momento todos los widgets que la usan.
+    """
+
+    def __init__(self, root, tkfont=None) -> None:
+        if tkfont is None:
+            import tkinter.font as tkfont
+        self._tkfont = tkfont
+        self._root = root
+        self._base: dict[str, int] = {}
+        for nombre in UI_NAMED_FONTS:
+            try:
+                self._base[nombre] = int(tkfont.nametofont(nombre, root=root).cget("size"))
+            except Exception:
+                continue
+
+    def apply(self, pct: int) -> None:
+        for nombre, base in self._base.items():
+            try:
+                self._tkfont.nametofont(nombre, root=self._root).configure(size=ui_scaled(base, pct))
+            except Exception:
+                continue
+
+
+class ScrollFrame(ttk.Frame):
+    """Contenedor con desplazamiento: las barras solo aparecen cuando el contenido no cabe en la ventana.
+
+    El contenido (``inner``) se ajusta al ancho disponible; si pide más alto del que hay (``enforce_height``) o más
+    ancho (``horizontal``), se desplaza en vez de recortarse. Con ``enforce_height`` desactivado el contenido
+    ocupa exactamente el espacio disponible, igual que sin contenedor.
+    """
+
+    def __init__(self, parent, *, padding=0, horizontal: bool = False, enforce_height: bool = True) -> None:
+        super().__init__(parent)
+        self.horizontal = horizontal
+        self.enforce_height = enforce_height
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=THEME_BG)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.inner = ttk.Frame(self.canvas, padding=padding)
+        self._win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda _e: self.relayout())
+        self.bind("<Configure>", lambda _e: self.relayout())
+        self._busy = False
+
+    def relayout(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            ow, oh = self.winfo_width(), self.winfo_height()
+            if ow <= 1 or oh <= 1:
+                return
+            sbw, sbh = self.vsb.winfo_reqwidth(), self.hsb.winfo_reqheight()
+            rw, rh = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+            need_v = self.enforce_height and rh > oh
+            need_h = self.horizontal and rw > ow - (sbw if need_v else 0)
+            if need_h and not need_v:
+                need_v = self.enforce_height and rh > oh - sbh
+            aw = ow - (sbw if need_v else 0)
+            ah = oh - (sbh if need_h else 0)
+            width = max(aw, rw) if self.horizontal else aw
+            height = max(ah, rh) if self.enforce_height else ah
+            self.canvas.itemconfigure(self._win, width=width, height=height)
+            self.canvas.configure(scrollregion=(0, 0, width, height))
+            if need_v:
+                self.vsb.grid(row=0, column=1, sticky="ns")
+            else:
+                self.vsb.grid_remove()
+                self.canvas.yview_moveto(0)
+            if need_h:
+                self.hsb.grid(row=1, column=0, sticky="ew")
+            else:
+                self.hsb.grid_remove()
+                self.canvas.xview_moveto(0)
+        finally:
+            self._busy = False
+
+    def scroll(self, pasos: int) -> bool:
+        """Desplaza en vertical; devuelve False si no hay nada que desplazar."""
+        if not self.vsb.winfo_ismapped():
+            return False
+        self.canvas.yview_scroll(pasos, "units")
+        return True
+
+
+_RUEDA_PROPIA = ("Treeview", "Text", "Listbox", "TCombobox", "Canvas", "TScrollbar")
+
+
+def scrollframe_wheel(event) -> None:
+    """Rueda del ratón sobre un ScrollFrame, salvo en widgets que ya la usan (tablas, mapa, listas...)."""
+    w = event.widget
+    try:
+        if w.winfo_class() in _RUEDA_PROPIA and not isinstance(w.master, ScrollFrame):
+            return
+    except Exception:
+        return
+    while w is not None and not isinstance(w, ScrollFrame):
+        w = getattr(w, "master", None)
+    if w is None:
+        return
+    num = getattr(event, "num", 0)
+    delta = getattr(event, "delta", 0)
+    pasos = -3 if (num == 4 or delta > 0) else 3
+    w.scroll(pasos)
+
+
+def map_place_level(zoom: float) -> tuple[int, bool, int] | None:
+    """Qué nombres de lugares se muestran a cada zoom: (población mínima, ¿capitales provinciales?, máx. etiquetas).
+
+    El máximo es para un mapa de ~1000x580 px; el código lo escala al tamaño real del visor.
+    Las capitales de país se muestran siempre que hay lugares. Muy alejado solo salen las mayores ciudades; al
+    acercarse el umbral baja y se van añadiendo más, hasta los pueblos más pequeños con el zoom máximo. Solo se
+    pintan los que caen dentro del visor y que caben sin pisarse. ``None`` = no se muestran lugares (solo países).
+    """
+    if zoom < 5.0:
+        return None
+    for limite, poblacion, provincias, maximo in (
+        (8.0, 3_000_000, False, 15),
+        (12.0, 1_500_000, False, 25),
+        (18.0, 500_000, True, 40),
+        (26.0, 150_000, True, 60),
+        (40.0, 50_000, True, 80),
+        (60.0, 20_000, True, 110),
+        (90.0, 8_000, True, 150),
+        (140.0, 3_000, True, 200),
+    ):
+        if zoom < limite:
+            return poblacion, provincias, maximo
+    return 500, True, 260  # zoom máximo (220x): todos los lugares que quepan en el visor
+
+
+def toolbar_logo_size(window_width: int) -> int:
+    """Lado (px) del logo de la cabecera según el ancho de la ventana: crece y se encoge con ella, con límites."""
+    return max(56, min(168, int(window_width * 0.14)))
 WORLD_MAP_GEOJSON = os.path.join(BASE_DIR, "assets", "map", "ne_110m_land.geojson")
 WORLD_COUNTRIES_GEOJSON = os.path.join(BASE_DIR, "assets", "map", "ne_110m_admin_0_countries.geojson")
 WORLD_PLACES_GEOJSON = os.path.join(BASE_DIR, "assets", "map", "ne_10m_populated_places.geojson")
@@ -736,9 +995,17 @@ class ContestLoggerApp:
         self._load_country_iso_index()
         self._load_world_prefixes()
 
+        self.ui_font_scale = 100
+        self._saved_ui_font_scale = 100
+        self._header_font_height = 0
+        self._ui_scaler = UiFontScaler(self.root)
+        self.ui_font_scale_var = tk.StringVar(value=ui_font_scale_label(100))
         self._build_ui()
         self._bind_events()
         self._load_settings()
+        # Tamaño del texto guardado: se aplica con la interfaz ya construida (las fuentes con nombre actualizan
+        # todos los widgets). El tamaño de la ventana no se toca.
+        self._apply_ui_font_scale(self._saved_ui_font_scale)
         self._ensure_all_template_default_dbs()
 
         initial_template = self._resolve_initial_template()
@@ -827,11 +1094,41 @@ class ContestLoggerApp:
             return saved
         return "general" if "general" in self.templates else self.template_ids[0]
 
+    def _on_toolbar_logo_resize(self, event) -> None:
+        job = getattr(self, "_toolbar_logo_job", None)
+        if job is not None:
+            self.root.after_cancel(job)
+        self._toolbar_logo_job = self.root.after(60, lambda w=event.width: self._render_toolbar_logo(toolbar_logo_size(w)))
+
+    def _render_toolbar_logo(self, size: int) -> None:
+        """Reescala el logo de la cabecera: con Pillow, suave; sin Pillow, por factores enteros (sin dependencias)."""
+        self._toolbar_logo_job = None
+        if size == getattr(self, "_toolbar_logo_size", 0):
+            return
+        self._toolbar_logo_size = size
+        try:
+            from PIL import Image, ImageTk
+
+            img = ImageTk.PhotoImage(Image.open(APP_TOOLBAR_LOGO).resize((size, size), Image.LANCZOS))
+        except Exception:
+            native = self._toolbar_logo_native
+            img = native if size >= TOOLBAR_LOGO_NATIVE else native.subsample(max(1, round(TOOLBAR_LOGO_NATIVE / size)))
+        self._toolbar_logo_img = img  # referencia: Tk no la conserva
+        self._toolbar_logo_label.configure(image=img)
+        self._toolbar_logo_header.configure(height=max(max(img.height(), size) + 16, getattr(self, "_header_font_height", 0)))
+
     def _build_ui(self):
         # Fixed header: the large logo overlays the free left area and does
         # not participate in geometry calculation, so it cannot make the
         # application header taller.
-        top = ttk.Frame(self.root, padding=8, height=140)
+        self._body_scroll = ScrollFrame(self.root, enforce_height=False)
+        self._body_scroll.pack(fill="both", expand=True)
+        body = self._body_scroll.inner
+        self.root.bind_all("<MouseWheel>", scrollframe_wheel, add="+")
+        self.root.bind_all("<Button-4>", scrollframe_wheel, add="+")
+        self.root.bind_all("<Button-5>", scrollframe_wheel, add="+")
+        top = ttk.Frame(body, padding=8, height=140)
+        self._header_frame = top
         top.pack(fill="x")
         top.pack_propagate(False)
 
@@ -841,15 +1138,14 @@ class ContestLoggerApp:
         actions.pack(side="right")
         try:
             if os.path.isfile(APP_TOOLBAR_LOGO):
-                toolbar_logo = tk.PhotoImage(file=APP_TOOLBAR_LOGO)
-                self._icon_refs.append(toolbar_logo)
-                tk.Label(
-                    top,
-                    image=toolbar_logo,
-                    bg=THEME_BG,
-                    bd=0,
-                    highlightthickness=0,
-                ).place(x=8, rely=0.5, anchor="w")
+                self._toolbar_logo_header = top
+                self._toolbar_logo_native = tk.PhotoImage(file=APP_TOOLBAR_LOGO)
+                self._toolbar_logo_label = tk.Label(top, bg=THEME_BG, bd=0, highlightthickness=0)
+                self._toolbar_logo_label.place(x=8, rely=0.5, anchor="w")
+                self._toolbar_logo_size = 0
+                self._toolbar_logo_job = None
+                top.bind("<Configure>", self._on_toolbar_logo_resize)
+                self._render_toolbar_logo(toolbar_logo_size(int(self.root.winfo_reqwidth() or 900)))
         except Exception:
             pass
         self.template_header_label = tk.Label(
@@ -892,7 +1188,7 @@ class ContestLoggerApp:
             anchor="w",
         ).grid(row=1, column=0, columnspan=6, sticky="ew", pady=(3, 0))
 
-        mid = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        mid = ttk.Frame(body, padding=(8, 0, 8, 8))
         mid.pack(fill="both", expand=True)
 
         self.form = ttk.LabelFrame(mid, text="Entrada QSO", padding=8)
@@ -1038,6 +1334,69 @@ class ContestLoggerApp:
         button.configure(menu=menu)
         self._log_menu = menu
 
+    def _tree_min_width(self, base: int) -> int:
+        """Ancho mínimo de columna: a 100 % el de siempre (20); con texto grande, el título cabe (se desplaza)."""
+        return 20 if self.ui_font_scale <= 100 else max(20, round(ui_scaled(int(base), self.ui_font_scale) * 0.75))
+
+    def _fs(self, size: int) -> int:
+        """Tamaño de letra escalado según el ajuste «Tamaño del texto» (para lo que se dibuja a mano)."""
+        return ui_scaled(size, self.ui_font_scale)
+
+    def _apply_ui_font_scale(self, pct) -> None:
+        """Aplica el tamaño del texto SIN cambiar el tamaño de la ventana: si el texto grande no cabe, el contenido
+        se desplaza (barras que solo aparecen cuando hacen falta)."""
+        pct = normalize_ui_font_scale(pct)
+        self.ui_font_scale = pct
+        self.ui_font_scale_var.set(ui_font_scale_label(pct))
+        self._ui_scaler.apply(pct)
+        try:
+            ttk.Style(self.root).configure("Treeview", rowheight=ui_scaled(22, pct))
+        except Exception:
+            pass
+        try:
+            self.template_header_label.configure(font=("TkDefaultFont", self._fs(11), "bold"))
+        except Exception:
+            pass
+        # La tabla pide un número fijo de filas visibles: con filas más altas se piden menos (el resto se desplaza).
+        tree = getattr(self, "tree", None)
+        if tree is not None:
+            try:
+                tree.configure(height=22 if pct == 100 else max(5, round(22 * 100 / (pct * 1.25))))
+            except Exception:
+                pass
+        for col, base in getattr(self, "_tree_base_widths", {}).items():
+            try:
+                self.tree.column(col, width=ui_scaled(base, pct), minwidth=self._tree_min_width(base))
+            except Exception:
+                pass
+        # Cabecera: crece lo justo para que quepa el cuadro «Estado» con el texto grande.
+        self._header_font_height = round(140 * (1 + 0.55 * (pct - 100) / 100.0)) if pct > 100 else 0
+        # El título del libro va centrado a 100 %; con texto grande los botones de la derecha ocupan el centro,
+        # así que pasa a la izquierda, junto al logo.
+        try:
+            if pct > 100:
+                self.template_header_label.place_configure(relx=0.0, x=toolbar_logo_size(int(self.root.winfo_width() or 900)) + 24, anchor="w")
+            else:
+                self.template_header_label.place_configure(relx=0.5, x=0, anchor="center")
+        except Exception:
+            pass
+        header = getattr(self, "_header_frame", None)
+        if header is not None:
+            if getattr(self, "_toolbar_logo_label", None) is not None:
+                self._toolbar_logo_size = 0  # fuerza recalcular la altura de la cabecera
+                self._render_toolbar_logo(toolbar_logo_size(int(self.root.winfo_width() or 900)))
+            else:
+                header.configure(height=max(140, self._header_font_height))
+        body_scroll = getattr(self, "_body_scroll", None)
+        if body_scroll is not None:
+            body_scroll.enforce_height = pct > 100  # a 100 % el cuerpo se comporta exactamente como antes
+            body_scroll.relayout()
+        self._schedule_map_refresh(10)
+
+    def _on_ui_font_scale_selected(self, _event=None) -> None:
+        self._apply_ui_font_scale(normalize_ui_font_scale(self.ui_font_scale_var.get()))
+        self._schedule_settings_save()
+
     def _on_settings_close(self):
         if self.settings_window is not None:
             try:
@@ -1070,14 +1429,27 @@ class ContestLoggerApp:
         notebook = ttk.Notebook(win)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        radio_tab = ttk.Frame(notebook, padding=10)
-        stn_tab = ttk.Frame(notebook, padding=10)
-        log_tab = ttk.Frame(notebook, padding=10)
-        sync_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(radio_tab, text="Radio / rigctld")
-        notebook.add(stn_tab, text="Estación / actividad")
-        notebook.add(log_tab, text="Log")
-        notebook.add(sync_tab, text="Sincronización")
+        # Cada pestaña se desplaza si el texto grande no cabe en la ventana de Ajustes (que mantiene su tamaño).
+        tab_frames = {}
+        for clave, titulo in (("radio", "Radio / rigctld"), ("stn", "Estación / actividad"), ("log", "Log"),
+                              ("sync", "Sincronización"), ("ui", "Interfaz")):
+            marco = ScrollFrame(notebook, padding=10, horizontal=True)
+            notebook.add(marco, text=titulo)
+            tab_frames[clave] = marco.inner
+        radio_tab, stn_tab, log_tab = tab_frames["radio"], tab_frames["stn"], tab_frames["log"]
+        sync_tab, ui_tab = tab_frames["sync"], tab_frames["ui"]
+        ttk.Label(ui_tab, text="Tamaño del texto").grid(row=0, column=0, sticky="w")
+        size_combo = ttk.Combobox(
+            ui_tab, textvariable=self.ui_font_scale_var, state="readonly", width=14,
+            values=[ui_font_scale_label(v) for v in UI_FONT_SCALES],
+        )
+        size_combo.grid(row=0, column=1, padx=(8, 0), sticky="w")
+        size_combo.bind("<<ComboboxSelected>>", self._on_ui_font_scale_selected)
+        ttk.Label(
+            ui_tab,
+            text="Agranda el texto, los formularios y las tablas para verlos mejor. Se aplica al momento.",
+            style="Muted.TLabel", wraplength=520,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Label(radio_tab, text="Host").grid(row=0, column=0, sticky="w")
         ttk.Entry(radio_tab, textvariable=self.host_var, width=16).grid(row=0, column=1, padx=(2, 4))
@@ -2355,17 +2727,25 @@ class ContestLoggerApp:
         if has_call_col:
             cols.extend(["__flag", "__country"])
         self.tree.configure(columns=cols)
+        # Anchos base (a 100 %); se escalan con «Tamaño del texto» para que los títulos no se corten.
+        self._tree_base_widths: dict[str, int] = {}
+
+        def _ancho(col, base: int, anchor: str) -> None:
+            self._tree_base_widths[str(col)] = int(base)
+            self.tree.column(col, width=ui_scaled(int(base), self.ui_font_scale), anchor=anchor,
+                             minwidth=self._tree_min_width(int(base)))
+
         for col in cols:
             self.tree.heading(col, text="")
-            self.tree.column(col, width=80, anchor="w")
+            _ancho(col, 80, "w")
         for col_id, label, width in ordered:
             self.tree.heading(col_id, text=label, command=lambda c=col_id: self._toggle_sort(c))
-            self.tree.column(col_id, width=int(width), anchor="w")
+            _ancho(col_id, int(width), "w")
         if has_call_col:
             self.tree.heading("__flag", text="Bandera", command=lambda c="__flag": self._toggle_sort(c))
-            self.tree.column("__flag", width=64, anchor="center")
+            _ancho("__flag", 64, "center")
             self.tree.heading("__country", text="País", command=lambda c="__country": self._toggle_sort(c))
-            self.tree.column("__country", width=170, anchor="w")
+            _ancho("__country", 170, "w")
 
     def _toggle_sort(self, column_id: str):
         column_id = str(column_id or "").strip()
@@ -2764,6 +3144,7 @@ class ContestLoggerApp:
             "log_ops_template_id": self._resolve_log_ops_template_id(),
             "template_db_map": self.template_db_map,
             "window_geometry": window_geometry,
+            "ui_font_scale": int(self.ui_font_scale),
         }
         try:
             os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
@@ -2782,6 +3163,7 @@ class ContestLoggerApp:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return
+            self._saved_ui_font_scale = normalize_ui_font_scale(data.get("ui_font_scale", 100))
             self.host_var.set(str(data.get("rig_host", DEFAULT_HOST) or DEFAULT_HOST))
             self.port_var.set(str(data.get("rig_port", DEFAULT_PORT) or DEFAULT_PORT))
             self.auto_poll_var.set(bool(data.get("rig_auto_poll", True)))
@@ -4088,6 +4470,32 @@ class ContestLoggerApp:
             return ""
         return self.normalize_call(self.current_qsos[src_idx].get("call", ""))
 
+    def _map_font(self, size: int, bold: bool = False):
+        """Fuente medible (tkfont) para calcular lo que ocupa cada etiqueta; en caché."""
+        cache = self.__dict__.setdefault("_map_font_cache", {})
+        key = (size, bold)
+        if key not in cache:
+            import tkinter.font as tkfont
+
+            cache[key] = MapTextMeter(
+                tkfont.Font(root=self.root, family="TkDefaultFont", size=size, weight="bold" if bold else "normal")
+            )
+        return cache[key]
+
+    def _map_label_box(self, x: float, y: float, text: str, font, anchor: str) -> tuple[float, float, float, float]:
+        w = font.width(text)
+        h = font.height
+        x0 = x if anchor == "w" else (x - w if anchor == "e" else x - w / 2.0)
+        return (x0, y - h / 2.0, x0 + w, y + h / 2.0)
+
+    def _map_plate_text(self, canvas, x: float, y: float, text: str, fill: str, font, anchor: str = "w") -> None:
+        """Texto sobre una placa oscura: legible sobre tierra, mar o líneas."""
+        item = canvas.create_text(x, y, text=text, anchor=anchor, fill=fill, font=font)
+        box = canvas.bbox(item)
+        if box:
+            plate = canvas.create_rectangle(box[0] - 3, box[1] - 1, box[2] + 3, box[3] + 1, fill=MAP_PLATE_BG, outline=fill)
+            canvas.tag_lower(plate, item)
+
     def _refresh_map_view(self):
         self._map_render_after_id = None
         canvas = self._map_canvas
@@ -4123,12 +4531,21 @@ class ContestLoggerApp:
             return (x, y)
 
         v_lon0, v_lon1, v_lat0, v_lat1 = self._visible_lonlat_bounds(width, height, ox, oy, map_w, map_h)
+        placer = MapLabelPlacer(pad=8, bounds=(2, 2, width - 2, height - 2))
 
         canvas.create_rectangle(ox, oy, ox + map_w, oy + map_h, fill="#0f1b2b", outline="#2c3f55", width=1)
-        canvas.create_text(ox + map_w * 0.18, oy + map_h * 0.42, text="PACIFIC OCEAN", fill="#32506c", font=("TkDefaultFont", 9))
-        canvas.create_text(ox + map_w * 0.50, oy + map_h * 0.43, text="ATLANTIC OCEAN", fill="#32506c", font=("TkDefaultFont", 9))
-        canvas.create_text(ox + map_w * 0.83, oy + map_h * 0.45, text="PACIFIC OCEAN", fill="#32506c", font=("TkDefaultFont", 9))
-        canvas.create_text(ox + map_w * 0.67, oy + map_h * 0.23, text="ARCTIC OCEAN", fill="#32506c", font=("TkDefaultFont", 9))
+        # Rótulos de océanos: siguen al mapa (zoom y desplazamiento) y solo se muestran alejado; antes estaban
+        # fijos en pantalla y «PACIFIC OCEAN» acababa sobre el Atlántico al acercarse.
+        if self._map_zoom < 4.0:
+            for ocean, fx, fy in (
+                ("PACIFIC OCEAN", 0.18, 0.42),
+                ("ATLANTIC OCEAN", 0.50, 0.43),
+                ("PACIFIC OCEAN", 0.83, 0.45),
+                ("ARCTIC OCEAN", 0.67, 0.23),
+            ):
+                ox_, oy_ = project(90.0 - fy * 180.0, fx * 360.0 - 180.0)
+                if 0 <= ox_ <= width and 0 <= oy_ <= height:
+                    canvas.create_text(ox_, oy_, text=ocean, fill="#32506c", font=("TkDefaultFont", self._fs(9)))
         for lat in (-60, -30, 0, 30, 60):
             y = oy + ((90.0 - lat) / 180.0) * map_h
             canvas.create_line(ox, y, ox + map_w, y, fill="#1f3248")
@@ -4175,14 +4592,62 @@ class ContestLoggerApp:
                 cell = (int((x - ox) // cell_w), int((y - oy) // cell_h))
                 if cell in used_cells:
                     continue
+                label = name.upper() if self._map_zoom >= 2.5 else name
+                size = self._fs(8 if self._map_zoom < 2.5 else 9)
+                box = self._map_label_box(x, y, label, self._map_font(size, True), "center")
+                if not placer.place(*box):
+                    continue
                 used_cells.add(cell)
-                canvas.create_text(
-                    x,
-                    y,
-                    text=name.upper() if self._map_zoom >= 2.5 else name,
-                    fill="#d7dde5",
-                    font=("TkDefaultFont", 8 if self._map_zoom < 2.5 else 9, "bold"),
-                )
+                canvas.create_text(x, y, text=label, fill="#d7dde5", font=("TkDefaultFont", size, "bold"))
+
+        selected_call = self._selected_callsign_for_map()
+        points: list[tuple[str, str, float, float]] = []
+        for q in self.current_qsos:
+            call = self.normalize_call(q.get("call", ""))
+            if selected_call and call != selected_call:
+                continue
+            loc = self._qso_locator(q)
+            ll = self._grid_to_latlon(loc)
+            if ll is None:
+                continue
+            lat, lon = ll
+            points.append((call, loc.upper(), lat, lon))
+
+        # Live preview from the form: lets us show map location for a new/unsaved call
+        # as soon as a valid locator is available (manual or auto lookup).
+        if selected_call:
+            form_loc = self._form_locator()
+            form_ll = self._grid_to_latlon(form_loc)
+            if form_ll is not None:
+                points.append((selected_call, form_loc.upper(), form_ll[0], form_ll[1]))
+
+        # Sitio de la ruta (marcadores, textos y la propia línea): los nombres de lugares se colocan DESPUÉS y lo
+        # esquivan, en vez de quedar tapados por las placas.
+        if selected_call and points:
+            f9, f9b = self._map_font(self._fs(9)), self._map_font(self._fs(9), True)
+            my_pre = self._grid_to_latlon(self.grid_var.get().strip())
+            my_pre_xy = project(my_pre[0], my_pre[1]) if my_pre is not None else None
+
+            def _reservar_texto(tx: float, ty: float, texto: str, fuente) -> None:
+                b = self._map_label_box(tx, ty, texto, fuente, "w")
+                placer.reserve(b[0] - 4, b[1] - 2, b[2] + 4, b[3] + 2)
+
+            if my_pre_xy is not None:
+                placer.reserve(my_pre_xy[0] - 8, my_pre_xy[1] - 8, my_pre_xy[0] + 8, my_pre_xy[1] + 8)
+                _reservar_texto(my_pre_xy[0] + 9, my_pre_xy[1] - 9, "Mi QTH", f9b)
+            for call_p, loc_p, lat_p, lon_p in {(q[0], q[1]): q for q in points}.values():
+                px, py = project(lat_p, lon_p)
+                placer.reserve(px - 8, py - 14, px + 9, py + 10)
+                _reservar_texto(px + 9, py - 9, f"{call_p} {loc_p}", f9)
+                if my_pre_xy is not None and my_pre is not None:
+                    km_p = self._haversine_km(my_pre[0], my_pre[1], lat_p, lon_p)
+                    _reservar_texto((my_pre_xy[0] + px) / 2.0 + 5, (my_pre_xy[1] + py) / 2.0 - 5, f"{km_p:.0f} km", f9b)
+                    largo = max(abs(px - my_pre_xy[0]), abs(py - my_pre_xy[1]))
+                    pasos = int(min(largo, 4000) // 22)
+                    for k in range(1, pasos):  # la línea: rectángulos pequeños a lo largo del trazo
+                        qx = my_pre_xy[0] + (px - my_pre_xy[0]) * k / pasos
+                        qy = my_pre_xy[1] + (py - my_pre_xy[1]) * k / pasos
+                        placer.reserve(qx - 9, qy - 6, qx + 9, qy + 6)
 
         # Layers: countries -> capitals -> populations.
         # Countries are drawn above; capitals/populations are zoom-gated here.
@@ -4192,26 +4657,8 @@ class ContestLoggerApp:
             # 10.0-13.0 -> add large populations
             # 13.0-17.0 -> add medium populations
             # 17.0+     -> add small populations
-            if self._map_zoom < 10.0:
-                mode = "capitals"
-                pop_threshold = 10**9
-                place_cell_w, place_cell_h = 220, 56
-                max_labels = 120
-            elif self._map_zoom < 13.0:
-                mode = "large"
-                pop_threshold = 700_000
-                place_cell_w, place_cell_h = 145, 38
-                max_labels = 150
-            elif self._map_zoom < 17.0:
-                mode = "medium"
-                pop_threshold = 250_000
-                place_cell_w, place_cell_h = 105, 27
-                max_labels = 240
-            else:
-                mode = "small"
-                pop_threshold = 50_000
-                place_cell_w, place_cell_h = 74, 19
-                max_labels = 360
+            min_pop, allow_prov_capitals, max_labels = map_place_level(self._map_zoom) or (10**9, False, 0)
+            max_labels = max(8, int(max_labels * (width * height) / 580_000.0))
 
             def _norm_lon(lon: float) -> float:
                 while lon < -180.0:
@@ -4241,7 +4688,6 @@ class ContestLoggerApp:
                 if lat_min <= p[2] <= lat_max and _lon_in_view(p[3], lon_min, lon_max)
             ]
 
-            place_cells: set[tuple[int, int]] = set()
             # Prioritize important places first so decluttering keeps capitals/major cities.
             ordered_places = sorted(
                 visible_places,
@@ -4254,59 +4700,36 @@ class ContestLoggerApp:
             )
             drawn_labels = 0
             for name, fclass, lat, lon, scalerank, pop_max, is_capital, is_prov_capital in ordered_places:
-                if mode == "capitals":
-                    if not (is_capital or is_prov_capital or scalerank <= 4):
-                        continue
-                elif mode == "large":
-                    if not (is_capital or is_prov_capital or pop_max >= pop_threshold):
-                        continue
-                elif mode == "medium":
-                    if not (is_capital or is_prov_capital or pop_max >= pop_threshold):
-                        continue
-                else:
-                    if not (is_capital or is_prov_capital or pop_max >= pop_threshold):
-                        continue
+                if not (is_capital or (allow_prov_capitals and is_prov_capital) or pop_max >= min_pop):
+                    continue
 
                 x, y = project(lat, lon)
                 if x < 0 or x > width or y < 0 or y > height:
                     continue
-                cell = (int(x // place_cell_w), int(y // place_cell_h))
-                if cell in place_cells:
-                    continue
-                place_cells.add(cell)
                 if drawn_labels >= max_labels:
                     break
                 dot_color = "#ff6b7a" if is_capital else ("#ffb37d" if is_prov_capital else "#7db7ff")
                 text_color = "#f3f6fa" if is_capital else ("#ffe9d6" if is_prov_capital else "#d6e3f3")
                 if self._map_zoom >= 20.0:
-                    font = ("TkDefaultFont", 7, "bold") if (is_capital or is_prov_capital) else ("TkDefaultFont", 7)
+                    font = ("TkDefaultFont", self._fs(7), "bold") if (is_capital or is_prov_capital) else ("TkDefaultFont", self._fs(7))
                 else:
-                    font = ("TkDefaultFont", 8, "bold") if (is_capital or is_prov_capital) else ("TkDefaultFont", 8)
+                    font = ("TkDefaultFont", self._fs(8), "bold") if (is_capital or is_prov_capital) else ("TkDefaultFont", self._fs(8))
                 r = 2 if (is_capital or is_prov_capital) else 1
+                # El nombre va a la derecha del punto; si ahí no cabe, a la izquierda; si no cabe en ningún
+                # sitio no se pinta ni el punto. Así nunca se pisan ni queda una nube de puntos sin nombre.
+                mfont = self._map_font(font[1], font[2:] == ("bold",))
+                placed = None
+                for ax, anchor in ((x + 4, "w"), (x - 4, "e")):
+                    box = self._map_label_box(ax, y - 2, name, mfont, anchor)
+                    if placer.place(*box):
+                        placed = (ax, anchor)
+                        break
+                if placed is None:
+                    continue
                 canvas.create_oval(x - r, y - r, x + r, y + r, fill=dot_color, outline=dot_color)
-                canvas.create_text(x + 4, y - 2, text=name, anchor="w", fill=text_color, font=font)
+                canvas.create_text(placed[0] + 1, y - 1, text=name, anchor=placed[1], fill="#08111b", font=font)  # sombra
+                canvas.create_text(placed[0], y - 2, text=name, anchor=placed[1], fill=text_color, font=font)
                 drawn_labels += 1
-
-        selected_call = self._selected_callsign_for_map()
-        points: list[tuple[str, str, float, float]] = []
-        for q in self.current_qsos:
-            call = self.normalize_call(q.get("call", ""))
-            if selected_call and call != selected_call:
-                continue
-            loc = self._qso_locator(q)
-            ll = self._grid_to_latlon(loc)
-            if ll is None:
-                continue
-            lat, lon = ll
-            points.append((call, loc.upper(), lat, lon))
-
-        # Live preview from the form: lets us show map location for a new/unsaved call
-        # as soon as a valid locator is available (manual or auto lookup).
-        if selected_call:
-            form_loc = self._form_locator()
-            form_ll = self._grid_to_latlon(form_loc)
-            if form_ll is not None:
-                points.append((selected_call, form_loc.upper(), form_ll[0], form_ll[1]))
 
         if not points:
             canvas.create_text(
@@ -4314,7 +4737,7 @@ class ContestLoggerApp:
                 oy + map_h / 2,
                 text="Sin coordenadas (GRID) en los contactos.",
                 fill="#e6eef5",
-                font=("TkDefaultFont", 11, "bold"),
+                font=("TkDefaultFont", self._fs(11), "bold"),
             )
             self._map_status_var.set("Sin datos para mostrar en el mapa.")
             return
@@ -4329,22 +4752,23 @@ class ContestLoggerApp:
         if my_ll is not None:
             my_xy = project(my_ll[0], my_ll[1])
             mx, my = my_xy
-            canvas.create_oval(mx - 5, my - 5, mx + 5, my + 5, fill="#ffea00", outline="#101010", width=1)
-            canvas.create_text(mx + 8, my - 8, text="Mi QTH", anchor="w", fill="#ffea00", font=("TkDefaultFont", 9, "bold"))
+            canvas.create_oval(mx - 5, my - 5, mx + 5, my + 5, fill=MAP_ROUTE_COLOR, outline=MAP_PLATE_BG, width=2)
+            self._map_plate_text(canvas, mx + 9, my - 9, "Mi QTH", MAP_ROUTE_COLOR, ("TkDefaultFont", self._fs(9), "bold"))
 
         for call, loc, lat, lon in draw_points:
             x, y = project(lat, lon)
             self._draw_station_antenna(canvas, x, y, selected=bool(selected_call))
             self._map_station_points.append((x, y, call, loc))
             if selected_call:
-                canvas.create_text(x + 8, y - 8, text=f"{call} {loc}", anchor="w", fill="#ffffff", font=("TkDefaultFont", 9))
+                self._map_plate_text(canvas, x + 9, y - 9, f"{call} {loc}", "#ffffff", ("TkDefaultFont", self._fs(9)))
             if selected_call and my_xy is not None:
                 mx, my = my_xy
-                canvas.create_line(mx, my, x, y, fill="#ffd166", width=2)
+                canvas.create_line(mx, my, x, y, fill=MAP_PLATE_BG, width=5)  # contorno oscuro: separa la línea del fondo
+                canvas.create_line(mx, my, x, y, fill=MAP_ROUTE_COLOR, width=2)
                 km = self._haversine_km(my_ll[0], my_ll[1], lat, lon) if my_ll is not None else 0.0
                 tx = (mx + x) / 2.0
                 ty = (my + y) / 2.0
-                canvas.create_text(tx + 4, ty - 4, text=f"{km:.0f} km", anchor="w", fill="#ffd166", font=("TkDefaultFont", 9, "bold"))
+                self._map_plate_text(canvas, tx + 5, ty - 5, f"{km:.0f} km", MAP_ROUTE_COLOR, ("TkDefaultFont", self._fs(9), "bold"))
 
         if selected_call:
             self._map_status_var.set(
@@ -5070,6 +5494,18 @@ class ContestLoggerApp:
 
     def _update_stats(self):
         self.rate_var.set(f"QSOs: {len(self.current_qsos)}")
+        # Si la plantilla trae su propia puntuación (reglas de SU concurso,
+        # p. ej. CQ WW RTTY: zonas + países + W/VE por banda), se usa esa; la
+        # cuenta genérica de prefijos solo vale para lo demás.
+        tpl = self.templates.get(self.current_template_id)
+        stats_text = getattr(tpl, "stats_text", None)
+        if stats_text is not None:
+            try:
+                my_call = self._station_snapshot(self.current_template_id)["operator"]
+                self.mult_var.set(stats_text(self.current_qsos, my_call=my_call, cty_path=self.world_prefix_csv))
+                return
+            except Exception as exc:
+                print(f"[NMN1M] puntuación de la plantilla falló, uso la genérica: {exc}")
         prefixes = {self.prefix_of(str(q.get("call", ""))) for q in self.current_qsos if self.prefix_of(str(q.get("call", "")))}
         self.mult_var.set(f"Multiplicadores: {len(prefixes)}")
 
@@ -5594,8 +6030,11 @@ class ContestLoggerApp:
                     "serial_recv": "SRX",
                     "notes": "COMMENT",
                 }
-                adif_key = mapping.get(key, "")
-                return upper.get(adif_key, "")
+                adif_keys = mapping.get(key, ())
+                for adif_key in (adif_keys,) if isinstance(adif_keys, str) else adif_keys:
+                    if upper.get(adif_key, ""):
+                        return upper[adif_key]
+                return ""
             aliases = csv_aliases.get(key, [key])
             return first_non_empty(data_l, aliases)
 
