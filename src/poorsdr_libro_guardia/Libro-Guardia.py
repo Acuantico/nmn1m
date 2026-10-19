@@ -6010,12 +6010,47 @@ class ContestLoggerApp:
             "serial_sent": ["serial_sent", "stx", "sent", "tx_serial"],
             "serial_recv": ["serial_recv", "srx", "recv", "rx_serial"],
             "notes": ["notes", "comment", "remarks", "qsl_info", "path", "wkd"],
+            "exchange_sent": ["exchange_sent", "stx_string", "zone_sent"],
+            "exchange_recv": ["exchange_recv", "srx_string", "zone_recv"],
+            "qth_recv": ["qth_recv", "state", "ve_prov"],
+            # Diploma DME: referencia del municipio contactado y la propia
+            # (si se activa), tal como las exportan otros programas.
+            "dme_ref": ["dme_ref", "dme", "referencia_dme", "ref_dme", "sig_info"],
+            "my_dme_ref": ["my_dme_ref", "mi_dme", "my_dme", "my_sig_info"],
+            "municipio": ["municipio", "qth", "city"],
             "mode": ["mode"],
             "band": ["band"],
             "freq": ["freq_hz", "frequency_hz", "freq", "frequency"],
         }
 
+        def dme_digits(raw: str) -> str:
+            # Solo el código INE (4-5 cifras): "08121 Mataró" -> "08121". Si no
+            # hay ninguno, vacío -- el QSO se importa igual, sin referencia.
+            m = re.search(r"(?<!\d)\d{4,5}(?!\d)", str(raw or ""))
+            return m.group(0) if m else ""
+
+        def dme_in_text(*texts: str) -> str:
+            for text in texts:
+                m = re.search(r"(?i)\bDME\s*[:#-]?\s*(\d{4,5})(?!\d)", str(text or ""))
+                if m:
+                    return m.group(1)
+            return ""
+
         def get_value(key: str) -> str:
+            if key in ("dme_ref", "my_dme_ref"):
+                own = key == "my_dme_ref"
+                if adif:
+                    sig, info = ("MY_SIG", "MY_SIG_INFO") if own else ("SIG", "SIG_INFO")
+                    if upper.get(sig, "").strip().upper() == "DME":
+                        return dme_digits(upper.get(info, ""))
+                    return "" if own else dme_in_text(upper.get("COMMENT", ""), upper.get("NOTES", ""))
+                sig_col = first_non_empty(data_l, ["my_sig"] if own else ["sig"])
+                if sig_col and sig_col.strip().upper() != "DME":
+                    return ""
+                value = dme_digits(first_non_empty(data_l, csv_aliases[key]))
+                if value or own:
+                    return value
+                return dme_in_text(first_non_empty(data_l, csv_aliases["notes"]))
             if adif:
                 mapping = {
                     "call": "CALL",
@@ -6029,6 +6064,15 @@ class ContestLoggerApp:
                     "serial_sent": "STX",
                     "serial_recv": "SRX",
                     "notes": "COMMENT",
+                    # Intercambio de concurso (p. ej. zona CQ + QTH EE.UU./Canadá
+                    # en CQ WW RTTY). Sin esto las plantillas que exigen
+                    # "exchange_*" recibían vacío, build_qso lanzaba y el QSO
+                    # llegado por UDP (panel RTTY, WSJT-X) se descartaba en
+                    # silencio.
+                    "exchange_sent": ("STX_STRING", "STX"),
+                    "exchange_recv": ("SRX_STRING", "SRX"),
+                    "qth_recv": ("STATE", "VE_PROV"),
+                    "municipio": "QTH",
                 }
                 adif_keys = mapping.get(key, ())
                 for adif_key in (adif_keys,) if isinstance(adif_keys, str) else adif_keys:
