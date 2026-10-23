@@ -26,6 +26,7 @@ ejecuta dentro de la aplicación.
 | `iaru_hf.py` | IARU HF | HAM |
 | `sm.py` | SM | HAM |
 | `cq_ww_rtty.py` | CQ WW RTTY | HAM |
+| `cq_ww_dx.py` | CQ WW DX (SSB y CW) | HAM |
 | `dme.py` | Diploma de Municipios de España (DME) | HAM |
 
 ## Crear una plantilla propia
